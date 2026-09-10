@@ -6,17 +6,21 @@ rather than as a single company-wide cutover.
 
 ## What's in here
 
-- **`scripts/migrate_archive.py`** — uploads a Thunderbird mbox folder tree
+- **`scripts/migrate_archive.py`** — uploads Thunderbird mbox folder trees
   (the classic `Foldername` + `Foldername.sbd` pattern) straight into an
   Exchange Online mailbox over IMAP, recreating the folder hierarchy as it
   goes. Written to work around Thunderbird's own drag-and-drop copy, which
-  failed (`TRYCREATE` errors) on deeply nested folders. Standard library
+  failed (`TRYCREATE` errors) on deeply nested folders. Supports migrating
+  several source accounts/profiles in one run, each landing under its own
+  top-level folder in the destination mailbox, and an optional list of
+  folder names (e.g. `Trash`) to leave out entirely. Standard library
   only — nothing to install. See the docstring at the top of the script for
   full usage details.
 - **`scripts/config.example.json`** — template for the script's
   configuration (tenant ID, app registration client ID, mailbox username,
-  local archive path). Copy it to `private/config.json` and fill in your own
-  values — see "Configuration" below.
+  and a `sources` list of local-folder → destination-folder mappings, plus
+  an optional `skip_folder_names` list). Copy it to `private/config.json`
+  and fill in your own values — see "Configuration" below.
 - **`docs/CHANGELOG.md`** — a record of the Exchange Online / mail-flow
   configuration changes made during this migration (mailbox aliasing, DKIM,
   SPF, accepted-domain type, etc.), with the reasoning behind each change and
@@ -31,9 +35,20 @@ are **not** committed to this repo:
 
 1. Copy `scripts/config.example.json` to `private/config.json`.
 2. Fill in your `tenant_id`, `client_id` (your own "device code" app
-   registration), `username`, and `source_dir` (the local path to your
-   Thunderbird `Archives.sbd` folder).
-3. Run the script as usual from `scripts/`.
+   registration), and `username` (the destination mailbox).
+3. Fill in `sources` — a list of `{"source_dir": ..., "dest_top_folder": ...}`
+   pairs. Each `source_dir` is a local directory holding one or more
+   Thunderbird top-level mbox files directly (for example a Thunderbird
+   `Mail/<host>` account folder, or a `Local Folders` directory) — everything
+   found in it, subfolders included, is recreated under `dest_top_folder` in
+   the destination mailbox. Add one entry per account/profile you're
+   migrating; they all land in the same mailbox, each under its own
+   top-level folder, sharing one migration_state.json.
+4. Optionally set `skip_folder_names` — folder names (matched
+   case-insensitively, at any depth, in any source) to leave out of the
+   migration entirely, folder and contents both. Used to skip `Trash`
+   folders when migrating a live profile.
+5. Run the script as usual from `scripts/`.
 
 ## The `private/` folder
 

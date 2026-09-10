@@ -2,10 +2,13 @@
 """
 migrate_archive.py
 
-Uploads a Thunderbird mbox folder tree (the classic "Foldername" + "Foldername.sbd"
+Uploads Thunderbird mbox folder trees (the classic "Foldername" + "Foldername.sbd"
 pattern) straight into an Exchange Online mailbox over IMAP, recreating the folder
 hierarchy as it goes. Written to work around Thunderbird's own drag-and-drop copy,
 which was failing (TRYCREATE errors) on deeply nested folders.
+
+Supports migrating multiple source accounts/profiles in a single run, each landing
+under its own top-level folder in the destination mailbox - see CONFIGURATION below.
 
 Requires only the Python standard library - nothing to install.
 
@@ -28,29 +31,44 @@ HOW IT TRACKS PROGRESS
 -----------------------
 Every folder it fully finishes gets recorded in migration_state.json (created next
 to this script). Re-running the script skips folders already marked done, so it's
-safe to stop (Ctrl+C) and resume later, or to just re-run after a crash.
+safe to stop (Ctrl+C) and resume later, or to just re-run after a crash. Progress is
+tracked per destination folder path, so this works the same whether you have one
+source or several.
 
 CONFIGURATION
 -------------
-This script reads its settings (tenant ID, app registration client ID,
-mailbox username, and the local Thunderbird archive path) from a config.json
-file rather than hardcoding them, since those are specific to your own
+This script reads its settings (tenant ID, app registration client ID, mailbox
+username, the source folder(s) to migrate, and any folder names to skip) from a
+config.json file rather than hardcoding them, since those are specific to your own
 tenant/mailbox and shouldn't be committed to a public repo.
 
     1. Copy config.example.json to ../private/config.json (relative to this
        script) - the "private" folder is git-ignored, so anything you put
        there never gets committed.
-    2. Fill in your own tenant_id, client_id, username, source_dir, and
-       (optionally) dest_top_folder.
-    3. Run the script as usual - it will pick up ../private/config.json
+    2. Fill in your own tenant_id, client_id, and username.
+    3. Fill in "sources": a list of {"source_dir": ..., "dest_top_folder": ...}
+       pairs. Each source_dir is a directory holding one or more Thunderbird
+       top-level mbox files directly (for example a Thunderbird "Mail/<host>"
+       account folder, or a "Local Folders" directory) - every top-level mbox
+       file found directly inside it (INBOX, Sent, Archives, etc., each with
+       its own optional "<name>.sbd" subfolder tree) is recreated, with its
+       full subfolder structure, under dest_top_folder in the destination
+       mailbox. List as many sources as you have accounts to migrate; they
+       all land in the same mailbox (USERNAME), each under its own
+       dest_top_folder, and all share one migration_state.json.
+    4. Optionally set "skip_folder_names": a list of folder names (matched
+       case-insensitively, at any depth in any source) to leave out of the
+       migration entirely - the folder itself and everything nested under it
+       (e.g. ["Trash"] to skip every Trash folder and its contents).
+    5. Run the script as usual - it will pick up ../private/config.json
        automatically if present, falling back to config.example.json
        (with its placeholder values) otherwise.
 
 USAGE
 -----
-    python migrate_archive.py                  # full run
+    python migrate_archive.py                  # full run, all configured sources
     python migrate_archive.py --dry-run         # list what would happen, no changes
-    python migrate_archive.py --only "2010"     # only migrate the "2010" folder (and its subfolders)
+    python migrate_archive.py --only "2010"     # only migrate folders whose destination path contains "2010"
     python migrate_archive.py --reset           # ignore the state file and start clean
 """
 
@@ -110,12 +128,16 @@ TENANT_ID = _cfg["tenant_id"]           # your Azure AD tenant ID
 CLIENT_ID = _cfg["client_id"]           # your "device code" app registration's client ID
 USERNAME = _cfg["username"]             # mailbox to sign in as / migrate into
 
-# Where the old Thunderbird archive lives (the "Archives.sbd" folder itself).
-SOURCE_DIR = _cfg["source_dir"]
+# List of {"source_dir": ..., "dest_top_folder": ...} pairs. Each source_dir is a
+# directory holding one or more Thunderbird top-level mbox files directly (plus
+# their optional "<name>.sbd" subfolder trees); everything found in it is recreated
+# under dest_top_folder in the destination mailbox. One entry per account/profile
+# being migrated - see the CONFIGURATION note above.
+SOURCES = _cfg["sources"]
 
-# Name of the top-level folder to create in the cloud mailbox. Everything under
-# SOURCE_DIR will be recreated as a subtree under this name.
-DEST_TOP_FOLDER = _cfg.get("dest_top_folder", "Archives")
+# Folder names (case-insensitive, matched at any depth in any source) to leave out
+# of the migration entirely - the folder itself and everything nested under it.
+SKIP_FOLDER_NAMES = {name.lower() for name in _cfg.get("skip_folder_names", [])}
 
 IMAP_HOST = "outlook.office365.com"
 IMAP_PORT = 993
@@ -409,6 +431,10 @@ def migrate_one_folder(session, local_folder_file, imap_path, state, dry_run):
     log(f"Finished: {imap_path} ({total} messages)")
 
 
+def _is_skipped(name):
+    return name.lower() in SKIP_FOLDER_NAMES
+
+
 def walk_and_migrate(session, local_dir, local_name, imap_parent_path, delimiter, state, dry_run, only_filter):
     """
     local_dir: directory containing `local_name` (mbox file) and `local_name.sbd` (subfolder dir), if any.
@@ -434,38 +460,72 @@ def walk_and_migrate(session, local_dir, local_name, imap_parent_path, delimiter
                 # a directory that isn't ".sbd" and isn't a skip suffix - shouldn't
                 # normally happen in a Thunderbird tree, but don't choke on it
                 continue
+            if _is_skipped(entry):
+                # Skip the folder AND everything nested under it - just don't
+                # recurse into it at all, so its own .sbd subtree (if any) is
+                # never even looked at.
+                log(f"Skipping folder (configured skip list): {imap_path}{delimiter}{entry}")
+                continue
             # `entry` here is a folder's own mbox file (e.g. "Fontana"); recurse
             # treating sbd_dir as the local_dir and entry as local_name
             walk_and_migrate(session, sbd_dir, entry, imap_path, delimiter, state, dry_run, only_filter)
 
 
+def migrate_source(session, source_dir, dest_top_folder, delimiter, state, dry_run, only_filter):
+    """
+    Migrate every top-level mbox file found directly inside `source_dir` (each with
+    its own optional "<name>.sbd" subfolder tree) so it lands under dest_top_folder
+    in the destination mailbox. `source_dir` is typically a Thunderbird account
+    folder (e.g. "Mail/mail.example.com") or a "Local Folders" directory - a
+    directory holding sibling top-level mbox files directly, not a single folder's
+    ".sbd" contents.
+    """
+    # Create the container folder itself first, even though no mail lands directly
+    # in it - its children need a real parent to nest under.
+    call_with_reconnect(session, ensure_folder, dest_top_folder, dry_run)
+
+    for entry in sorted(os.listdir(source_dir)):
+        if entry.endswith(SKIP_SUFFIXES):
+            continue
+        if entry.endswith(".sbd"):
+            continue  # handled as the sibling of its base mbox file
+        full = os.path.join(source_dir, entry)
+        if not os.path.isfile(full):
+            continue
+        if _is_skipped(entry):
+            log(f"Skipping folder (configured skip list): {dest_top_folder}{delimiter}{entry}")
+            continue
+        walk_and_migrate(session, source_dir, entry, dest_top_folder, delimiter, state, dry_run, only_filter)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen, make no changes")
-    parser.add_argument("--only", default=None, help="Only migrate folders whose IMAP path contains this substring")
+    parser.add_argument("--only", default=None, help="Only migrate folders whose destination path contains this substring")
     parser.add_argument("--reset", action="store_true", help="Ignore existing migration_state.json and start over")
     args = parser.parse_args()
 
     if args.reset and os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)
 
-    if not os.path.isdir(SOURCE_DIR):
-        log(f"ERROR: SOURCE_DIR does not exist: {SOURCE_DIR}")
-        sys.exit(1)
+    for src in SOURCES:
+        if not os.path.isdir(src["source_dir"]):
+            log(f"ERROR: source_dir does not exist: {src['source_dir']}")
+            sys.exit(1)
 
     state = load_state()
 
     session = ImapSession()
     delimiter = call_with_reconnect(session, get_delimiter)
     log(f"Connected. Folder hierarchy delimiter is: {delimiter!r}")
+    if SKIP_FOLDER_NAMES:
+        log(f"Skipping folders named: {sorted(SKIP_FOLDER_NAMES)}")
 
-    # SOURCE_DIR is itself the ".sbd" contents of the top-level "Archives" folder,
-    # i.e. its parent directory holds the sibling "Archives" mbox file (if any) and
-    # "Archives.sbd" == SOURCE_DIR. We treat DEST_TOP_FOLDER as that top folder.
-    parent_dir = os.path.dirname(SOURCE_DIR)
-    walk_and_migrate(
-        session, parent_dir, DEST_TOP_FOLDER, "", delimiter, state, args.dry_run, args.only
-    )
+    for src in SOURCES:
+        log(f"--- Migrating {src['source_dir']}  ->  {src['dest_top_folder']} ---")
+        migrate_source(
+            session, src["source_dir"], src["dest_top_folder"], delimiter, state, args.dry_run, args.only
+        )
 
     try:
         session.imap.logout()

@@ -2,6 +2,15 @@
   "tenant_id": "YOUR-AZURE-AD-TENANT-ID",
   "client_id": "YOUR-APP-REGISTRATION-CLIENT-ID",
   "username": "user@yourdomain.example",
-  "source_dir": "C:\\Users\\YourUser\\AppData\\Roaming\\Thunderbird\\Profiles\\xxxxxxxx.default\\Mail\\Local Folders\\Archives.sbd",
-  "dest_top_folder": "Archives"
+  "sources": [
+    {
+      "source_dir": "C:\\Users\\YourUser\\AppData\\Roaming\\Thunderbird\\Profiles\\xxxxxxxx.default\\Mail\\mail.example1.com",
+      "dest_top_folder": "Account-1"
+    },
+    {
+      "source_dir": "C:\\Users\\YourUser\\AppData\\Roaming\\Thunderbird\\Profiles\\xxxxxxxx.default\\Mail\\mail.example2.com",
+      "dest_top_folder": "Account-2"
+    }
+  ],
+  "skip_folder_names": ["Trash"]
 }
