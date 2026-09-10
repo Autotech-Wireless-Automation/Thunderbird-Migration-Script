@@ -1,0 +1,14 @@
+# Sensitive/internal-only material - never push this folder.
+private/
+
+# Runtime artifacts created by migrate_archive.py next to itself.
+migration_state.json
+migration_log.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
