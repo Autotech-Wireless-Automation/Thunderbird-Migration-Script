@@ -35,6 +35,17 @@ safe to stop (Ctrl+C) and resume later, or to just re-run after a crash. Progres
 tracked per destination folder path, so this works the same whether you have one
 source or several.
 
+Before touching the network, the script does a quick local pass over every source
+to count how many messages it's dealing with in total, so it can show real
+percentages from the very first message rather than guessing. On a run migrating
+hundreds of thousands of messages, printing one line per message would make the
+console unreadable, so instead the console shows a compact, self-updating 2-line
+status: what it's working on right now, and a percentage/elapsed/ETA line below it
+that recalculates its throughput estimate as it goes (so the ETA adapts if a
+reconnect slows things down, or a big folder speeds them back up). Every
+individual message is still recorded in migration_log.txt, one line each, exactly
+as before - only the screen itself gets the compact view.
+
 CONFIGURATION
 -------------
 This script reads its settings (tenant ID, app registration client ID, mailbox
@@ -150,6 +161,16 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migration_l
 # safe to ignore entirely.
 SKIP_SUFFIXES = (".msf", ".mozmsgs")
 
+# Exact (case-insensitive) filenames Thunderbird drops directly inside an account
+# folder that are also NOT mail data - account-level settings/state, not a folder.
+# Seen in the wild: msgFilterRules.dat (per-account filter rules), popstate.dat
+# (POP3 UIDL/state tracking), filterlog.html (optional filter activity log).
+NON_MAIL_FILENAMES = {"msgfilterrules.dat", "popstate.dat", "filterlog.html"}
+
+
+def _is_metadata_file(name):
+    return name.lower() in NON_MAIL_FILENAMES
+
 APPEND_RETRY_ATTEMPTS = 5
 APPEND_RETRY_BASE_DELAY = 2.0   # seconds, doubles each retry (exponential backoff)
 APPEND_PACING_DELAY = 0.15      # small delay between appends to be gentle on the server
@@ -160,11 +181,141 @@ RECONNECT_PAUSE = 3.0           # seconds to wait before reconnecting
 # ============================================================================
 
 
+_PROGRESS = None  # set once main() has sized up the run; see ProgressTracker
+
+
 def log(msg):
+    """Console + file. For real events (signed in, folder created/skipped,
+    reconnects, per-folder summaries) - infrequent enough not to spam the screen.
+    Plays nicely with the live status block, if one is active: temporarily clears
+    it, prints this line above where it was, then redraws it underneath."""
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    if _PROGRESS is not None:
+        _PROGRESS.clear()
     print(line, flush=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    if _PROGRESS is not None:
+        _PROGRESS.repaint()
+
+
+def log_file(msg):
+    """File only - the detailed per-message trail. Kept in full in
+    migration_log.txt for later audit/debugging, but never printed to the screen:
+    at hundreds of thousands of messages that would be unreadable, which is what
+    the live status block (see ProgressTracker) is for instead."""
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+class ProgressTracker:
+    """Renders a compact, in-place 2-line status instead of scrolling one line per
+    message: line 1 is what it's working on right now, line 2 is percent complete
+    (to 2 decimals), elapsed time, and a self-calibrating ETA. "Self-calibrating"
+    means the throughput estimate is recomputed from actual recent progress (the
+    last WINDOW_SECONDS), not a fixed guess - so it adapts if a reconnect slows
+    things down or a big folder speeds them back up, falling back to the
+    since-the-start average whenever there isn't enough recent data yet (e.g. right
+    after startup, or right after a reconnect pause)."""
+
+    WINDOW_SECONDS = 30.0        # only look at the last N seconds of throughput for the ETA
+    REPAINT_MIN_INTERVAL = 0.1  # seconds - don't repaint faster than this
+
+    def __init__(self, grand_total, already_done=0):
+        self.grand_total = grand_total
+        self.done = already_done
+        self.start_time = time.time()
+        self._samples = [(self.start_time, already_done)]
+        self._last_repaint = 0.0
+        self._active = False   # whether the 2-line status block is currently on screen
+        self._last_label = ""
+
+    def _rate(self):
+        now = time.time()
+        cutoff = now - self.WINDOW_SECONDS
+        trimmed = [(t, n) for (t, n) in self._samples if t >= cutoff]
+        self._samples = trimmed or self._samples[-1:]
+        t0, n0 = self._samples[0]
+        t1, n1 = self._samples[-1]
+        if t1 > t0 and n1 > n0:
+            recent_rate = (n1 - n0) / (t1 - t0)
+            if recent_rate > 0:
+                return recent_rate
+        # Not enough recent data (just started, or mid-reconnect-pause) - fall back
+        # to the overall average so far rather than showing a stalled/zero ETA.
+        elapsed = now - self.start_time
+        return (self.done / elapsed) if elapsed > 0 and self.done > 0 else 0.0
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        if seconds is None:
+            return "calculating..."
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def advance(self, n=1):
+        self.done += n
+        self._samples.append((time.time(), self.done))
+
+    def _lines(self, label):
+        now = time.time()
+        pct = (self.done / self.grand_total * 100.0) if self.grand_total else 100.0
+        elapsed = now - self.start_time
+        rate = self._rate()
+        remaining = max(0, self.grand_total - self.done)
+        eta_seconds = (remaining / rate) if rate > 0 else None
+        finish_clock = (
+            time.strftime("%H:%M:%S", time.localtime(now + eta_seconds))
+            if eta_seconds is not None else "--:--:--"
+        )
+        line1 = f"Working on: {label}"
+        line2 = (
+            f"{pct:6.2f}%  ({self.done:,}/{self.grand_total:,} messages)  "
+            f"elapsed {self._fmt_duration(elapsed)}  "
+            f"ETA {self._fmt_duration(eta_seconds)} (finish ~{finish_clock})"
+        )
+        return line1[:140], line2[:140]
+
+    def render(self, label, force=False):
+        now = time.time()
+        self._last_label = label
+        if not force and (now - self._last_repaint) < self.REPAINT_MIN_INTERVAL:
+            return
+        self._last_repaint = now
+        line1, line2 = self._lines(label)
+        if self._active:
+            sys.stdout.write("\x1b[2A")  # cursor up 2 lines, back to the start of line1
+        sys.stdout.write("\x1b[2K" + line1 + "\n")
+        sys.stdout.write("\x1b[2K" + line2 + "\n")
+        sys.stdout.flush()
+        self._active = True
+
+    def clear(self):
+        """Temporarily remove the status block so a normal scrolling log line can
+        be printed where it was; call repaint() afterwards to put it back."""
+        if self._active:
+            sys.stdout.write("\x1b[2A")  # up to the start of line1
+            sys.stdout.write("\x1b[0J")  # erase everything from there to end of screen
+            sys.stdout.flush()
+            self._active = False
+
+    def repaint(self):
+        if self._last_label:
+            self.render(self._last_label, force=True)
+
+    def finish(self):
+        if self._last_label:
+            self.render(self._last_label, force=True)
+        if self._active:
+            print()  # leave a blank line so later log() calls scroll normally below
+            self._active = False
 
 
 # ----------------------------- OAuth2 device code flow -----------------------
@@ -417,14 +568,17 @@ def migrate_one_folder(session, local_folder_file, imap_path, state, dry_run):
         raw = box.get_bytes(key)
         idate = internaldate_for(raw)
         if dry_run:
-            log(f"[dry-run] would APPEND message {i + 1}/{total} to {imap_path}")
+            log_file(f"[dry-run] would APPEND message {i + 1}/{total} to {imap_path}")
         else:
             call_with_reconnect(session, append_message, imap_path, raw, idate)
             time.sleep(APPEND_PACING_DELAY)
+            log_file(f"APPENDed message {i + 1}/{total} to {imap_path}")
         state["folder_progress"][imap_path] = i + 1
+        if _PROGRESS is not None:
+            _PROGRESS.advance(1)
+            _PROGRESS.render(f"{imap_path}  [{i + 1:,}/{total:,}]")
         if (i + 1) % 25 == 0:
             save_state(state)
-            log(f"{imap_path}: {i + 1}/{total}")
 
     state["folders_done"][imap_path] = True
     save_state(state)
@@ -435,9 +589,17 @@ def _is_skipped(name):
     return name.lower() in SKIP_FOLDER_NAMES
 
 
-def walk_and_migrate(session, local_dir, local_name, imap_parent_path, delimiter, state, dry_run, only_filter):
+def iter_folder_tree(local_dir, local_name, imap_parent_path, delimiter, only_filter, announce):
     """
-    local_dir: directory containing `local_name` (mbox file) and `local_name.sbd` (subfolder dir), if any.
+    Yields (imap_path, mbox_file) for `local_name` itself and everything nested
+    under its "<local_name>.sbd" subfolder tree, honoring --only and
+    skip_folder_names exactly as the real run will. Pure filesystem walk - no
+    IMAP, no state - so the planning pass (which sizes up the progress bar) and
+    the real migration pass (which actually appends messages) can share this one
+    definition of "what gets migrated" instead of two that could drift apart.
+
+    local_dir: directory containing `local_name` (mbox file) and `local_name.sbd`
+    (subfolder dir), if any.
     """
     imap_path = f"{imap_parent_path}{delimiter}{local_name}" if imap_parent_path else local_name
 
@@ -447,11 +609,11 @@ def walk_and_migrate(session, local_dir, local_name, imap_parent_path, delimiter
     do_this_folder = (not only_filter) or (only_filter in imap_path)
 
     if do_this_folder:
-        migrate_one_folder(session, mbox_file, imap_path, state, dry_run)
+        yield (imap_path, mbox_file)
 
     if os.path.isdir(sbd_dir):
         for entry in sorted(os.listdir(sbd_dir)):
-            if entry.endswith(SKIP_SUFFIXES):
+            if entry.endswith(SKIP_SUFFIXES) or _is_metadata_file(entry):
                 continue
             full = os.path.join(sbd_dir, entry)
             if entry.endswith(".sbd"):
@@ -464,28 +626,26 @@ def walk_and_migrate(session, local_dir, local_name, imap_parent_path, delimiter
                 # Skip the folder AND everything nested under it - just don't
                 # recurse into it at all, so its own .sbd subtree (if any) is
                 # never even looked at.
-                log(f"Skipping folder (configured skip list): {imap_path}{delimiter}{entry}")
+                if announce:
+                    log(f"Skipping folder (configured skip list): {imap_path}{delimiter}{entry}")
                 continue
             # `entry` here is a folder's own mbox file (e.g. "Fontana"); recurse
             # treating sbd_dir as the local_dir and entry as local_name
-            walk_and_migrate(session, sbd_dir, entry, imap_path, delimiter, state, dry_run, only_filter)
+            yield from iter_folder_tree(sbd_dir, entry, imap_path, delimiter, only_filter, announce)
 
 
-def migrate_source(session, source_dir, dest_top_folder, delimiter, state, dry_run, only_filter):
+def iter_source_tree(source_dir, dest_top_folder, delimiter, only_filter, announce):
     """
-    Migrate every top-level mbox file found directly inside `source_dir` (each with
-    its own optional "<name>.sbd" subfolder tree) so it lands under dest_top_folder
-    in the destination mailbox. `source_dir` is typically a Thunderbird account
+    Yields (imap_path, mbox_file) for every top-level mbox file found directly
+    inside `source_dir` (each with its own optional "<name>.sbd" subfolder tree),
+    landing under dest_top_folder. `source_dir` is typically a Thunderbird account
     folder (e.g. "Mail/mail.example.com") or a "Local Folders" directory - a
     directory holding sibling top-level mbox files directly, not a single folder's
-    ".sbd" contents.
+    ".sbd" contents. Does not include dest_top_folder itself (the container has no
+    messages of its own; see migrate_source for creating it).
     """
-    # Create the container folder itself first, even though no mail lands directly
-    # in it - its children need a real parent to nest under.
-    call_with_reconnect(session, ensure_folder, dest_top_folder, dry_run)
-
     for entry in sorted(os.listdir(source_dir)):
-        if entry.endswith(SKIP_SUFFIXES):
+        if entry.endswith(SKIP_SUFFIXES) or _is_metadata_file(entry):
             continue
         if entry.endswith(".sbd"):
             continue  # handled as the sibling of its base mbox file
@@ -493,9 +653,52 @@ def migrate_source(session, source_dir, dest_top_folder, delimiter, state, dry_r
         if not os.path.isfile(full):
             continue
         if _is_skipped(entry):
-            log(f"Skipping folder (configured skip list): {dest_top_folder}{delimiter}{entry}")
+            if announce:
+                log(f"Skipping folder (configured skip list): {dest_top_folder}{delimiter}{entry}")
             continue
-        walk_and_migrate(session, source_dir, entry, dest_top_folder, delimiter, state, dry_run, only_filter)
+        yield from iter_folder_tree(source_dir, entry, dest_top_folder, delimiter, only_filter, announce)
+
+
+def _count_messages(mbox_file):
+    if not os.path.exists(mbox_file) or os.path.getsize(mbox_file) == 0:
+        return 0
+    box = mailbox.mbox(mbox_file, factory=None, create=False)
+    return len(box.keys())
+
+
+def plan_totals(sources, delimiter, only_filter, state):
+    """One quiet, local-only pass over every source (no network, no announcing of
+    skips - the real run does that) to total up exactly how many messages this run
+    is dealing with, and how many of those are already done from a previous run -
+    so the progress bar can show accurate numbers from message #1 instead of
+    growing its denominator as it goes."""
+    grand_total = 0
+    already_done = 0
+    for src in sources:
+        for imap_path, mbox_file in iter_source_tree(
+            src["source_dir"], src["dest_top_folder"], delimiter, only_filter, announce=False
+        ):
+            total = _count_messages(mbox_file)
+            grand_total += total
+            if state["folders_done"].get(imap_path):
+                already_done += total
+            else:
+                already_done += min(state["folder_progress"].get(imap_path, 0), total)
+    return grand_total, already_done
+
+
+def migrate_source(session, source_dir, dest_top_folder, delimiter, state, dry_run, only_filter):
+    """
+    Migrate every top-level mbox file found directly inside `source_dir` (each with
+    its own optional "<name>.sbd" subfolder tree) so it lands under dest_top_folder
+    in the destination mailbox.
+    """
+    # Create the container folder itself first, even though no mail lands directly
+    # in it - its children need a real parent to nest under.
+    call_with_reconnect(session, ensure_folder, dest_top_folder, dry_run)
+
+    for imap_path, mbox_file in iter_source_tree(source_dir, dest_top_folder, delimiter, only_filter, announce=True):
+        migrate_one_folder(session, mbox_file, imap_path, state, dry_run)
 
 
 def main():
@@ -521,11 +724,22 @@ def main():
     if SKIP_FOLDER_NAMES:
         log(f"Skipping folders named: {sorted(SKIP_FOLDER_NAMES)}")
 
+    log("Scanning source folders to size up the run (local disk only, no network yet)...")
+    grand_total, already_done = plan_totals(SOURCES, delimiter, args.only, state)
+    global _PROGRESS
+    _PROGRESS = ProgressTracker(grand_total, already_done)
+    log(
+        f"Found {grand_total:,} message(s) across {len(SOURCES)} source(s) to account for "
+        f"({already_done:,} already done from a previous run)."
+    )
+
     for src in SOURCES:
         log(f"--- Migrating {src['source_dir']}  ->  {src['dest_top_folder']} ---")
         migrate_source(
             session, src["source_dir"], src["dest_top_folder"], delimiter, state, args.dry_run, args.only
         )
+
+    _PROGRESS.finish()
 
     try:
         session.imap.logout()
