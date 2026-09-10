@@ -477,14 +477,14 @@ def ensure_folder(imap, path, dry_run):
     if folder_exists(imap, path):
         return
     if dry_run:
-        log(f"[dry-run] would CREATE folder: {path}")
+        log_file(f"[dry-run] would CREATE folder: {path}")
         _existing_folders_cache.add(path)
         return
     typ, data = imap.create(f'"{path}"')
     if typ != "OK":
         raise RuntimeError(f"Could not create folder {path}: {data}")
     _existing_folders_cache.add(path)
-    log(f"Created folder: {path}")
+    log_file(f"Created folder: {path}")
 
 
 def append_message(imap, folder_path, raw_bytes, internaldate):
@@ -501,7 +501,11 @@ def append_message(imap, folder_path, raw_bytes, internaldate):
         except Exception as e:
             last_err = e
         delay = APPEND_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-        log(f"  append retry {attempt}/{APPEND_RETRY_ATTEMPTS} after error: {last_err} (sleeping {delay:.0f}s)")
+        # A retry is a real, occasionally-useful-to-notice event, but on a run this
+        # long it can also repeat often enough to spam the console - keep it in the
+        # file; a stalled elapsed-time on the live status line is the on-screen tell
+        # that something's being retried.
+        log_file(f"  append retry {attempt}/{APPEND_RETRY_ATTEMPTS} after error: {last_err} (sleeping {delay:.0f}s)")
         time.sleep(delay)
     raise RuntimeError(f"Giving up on a message in {folder_path}: {last_err}")
 
@@ -518,6 +522,17 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+def maybe_save_state(state, dry_run):
+    """A --dry-run must never persist migration_state.json - it hasn't actually
+    created any folders or appended any messages, so marking anything "done" would
+    make a *real* run afterwards think that work is finished and silently skip it.
+    Real runs always save; dry runs never do (state is still updated in memory for
+    the duration of this process, only so --only / repeated-folder edge cases and
+    the live progress numbers behave sensibly within the one dry-run pass)."""
+    if not dry_run:
+        save_state(state)
 
 
 # ----------------------------- mbox walking ------------------------------------
@@ -538,18 +553,27 @@ def internaldate_for(raw_bytes):
 
 
 def migrate_one_folder(session, local_folder_file, imap_path, state, dry_run):
-    """Append all messages in a single mbox file to imap_path, resuming if needed."""
+    """Append all messages in a single mbox file to imap_path, resuming if needed.
+
+    Every per-folder event here (already-done, folder created, message counts,
+    finished) goes to log_file() only, not log() - on a tree with thousands of
+    small folders these fire constantly, which is exactly the console spam the
+    live status line replaces. Only the status line (line 1: current folder and
+    position; line 2: percent/elapsed/ETA) is meant to visibly change per folder;
+    everything else stays in migration_log.txt for later review."""
     if state["folders_done"].get(imap_path):
-        log(f"Skipping (already done): {imap_path}")
+        log_file(f"Skipping (already done): {imap_path}")
         return
 
     # Always create the folder itself, even if it holds no direct messages -
     # its children (if any) need a real parent to nest under.
     call_with_reconnect(session, ensure_folder, imap_path, dry_run)
+    if _PROGRESS is not None:
+        _PROGRESS.render(imap_path)
 
     if not os.path.exists(local_folder_file) or os.path.getsize(local_folder_file) == 0:
         state["folders_done"][imap_path] = True
-        save_state(state)
+        maybe_save_state(state, dry_run)
         return
 
     start_index = state["folder_progress"].get(imap_path, 0)
@@ -561,7 +585,7 @@ def migrate_one_folder(session, local_folder_file, imap_path, state, dry_run):
     box = mailbox.mbox(local_folder_file, factory=None, create=False)
     keys = list(box.keys())
     total = len(keys)
-    log(f"{imap_path}: {total} message(s) in source, resuming at {start_index}")
+    log_file(f"{imap_path}: {total} message(s) in source, resuming at {start_index}")
     for i, key in enumerate(keys):
         if i < start_index:
             continue
@@ -578,11 +602,11 @@ def migrate_one_folder(session, local_folder_file, imap_path, state, dry_run):
             _PROGRESS.advance(1)
             _PROGRESS.render(f"{imap_path}  [{i + 1:,}/{total:,}]")
         if (i + 1) % 25 == 0:
-            save_state(state)
+            maybe_save_state(state, dry_run)
 
     state["folders_done"][imap_path] = True
-    save_state(state)
-    log(f"Finished: {imap_path} ({total} messages)")
+    maybe_save_state(state, dry_run)
+    log_file(f"Finished: {imap_path} ({total} messages)")
 
 
 def _is_skipped(name):
@@ -627,7 +651,7 @@ def iter_folder_tree(local_dir, local_name, imap_parent_path, delimiter, only_fi
                 # recurse into it at all, so its own .sbd subtree (if any) is
                 # never even looked at.
                 if announce:
-                    log(f"Skipping folder (configured skip list): {imap_path}{delimiter}{entry}")
+                    log_file(f"Skipping folder (configured skip list): {imap_path}{delimiter}{entry}")
                 continue
             # `entry` here is a folder's own mbox file (e.g. "Fontana"); recurse
             # treating sbd_dir as the local_dir and entry as local_name
@@ -654,7 +678,7 @@ def iter_source_tree(source_dir, dest_top_folder, delimiter, only_filter, announ
             continue
         if _is_skipped(entry):
             if announce:
-                log(f"Skipping folder (configured skip list): {dest_top_folder}{delimiter}{entry}")
+                log_file(f"Skipping folder (configured skip list): {dest_top_folder}{delimiter}{entry}")
             continue
         yield from iter_folder_tree(source_dir, entry, dest_top_folder, delimiter, only_filter, announce)
 
